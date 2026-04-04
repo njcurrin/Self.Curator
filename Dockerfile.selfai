@@ -50,7 +50,7 @@ WORKDIR /opt/Curator
 COPY pyproject.toml uv.lock /opt/Curator/
 COPY nemo_curator/__init__.py nemo_curator/package_info.py /opt/Curator/nemo_curator/
 
-RUN uv sync --link-mode copy --locked --extra text_cpu --all-groups --no-cache && \
+RUN uv sync --link-mode copy --locked --extra text_cpu --extra deduplication_cuda12 --all-groups --no-cache && \
     find /opt/venv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 
 COPY . /opt/Curator
@@ -84,9 +84,9 @@ ENV HF_HOME="/workspace/curator/cache/hf-hub"
 RUN curl -LsSf https://astral.sh/uv/0.8.22/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
-# Install FastAPI and dependencies into the existing venv
+# Install FastAPI, test dependencies into the existing venv
 RUN uv pip install --no-cache-dir \
-    fastapi "uvicorn[standard]" aiofiles pyyaml
+    fastapi "uvicorn[standard]" aiofiles pyyaml pytest pytest-asyncio
 
 # Create workspace directories
 RUN mkdir -p /workspace/curator/data \
@@ -96,8 +96,9 @@ RUN mkdir -p /workspace/curator/data \
              /workspace/curator/cache/hf-hub \
              /workspace/curator/custom_stages
 
-# Copy API code
+# Copy API code and tests
 COPY api/ /app/api/
+COPY tests/ /app/tests/
 
 # supervisord configuration
 COPY supervisord.conf /etc/supervisor/conf.d/curator.conf
