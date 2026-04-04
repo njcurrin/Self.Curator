@@ -37,6 +37,7 @@ API_VERSION = "1.0.0"
 
 class JobStatus(str, Enum):
     PENDING = "pending"
+    SCHEDULED = "scheduled"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -54,6 +55,8 @@ class CurationJobCreate(BaseModel):
     output_path: str
     text_field: str = "text"
     stages: List[StageConfig]
+    output_format: Optional[str] = None
+    scheduled_for: Optional[datetime] = None
 
     class Config:
         json_schema_extra = {
@@ -76,6 +79,10 @@ class CurationJobCreate(BaseModel):
         }
 
 
+class ScheduleJobRequest(BaseModel):
+    scheduled_for: float  # Unix timestamp
+
+
 class CurationJob(BaseModel):
     job_id: str
     name: str
@@ -87,10 +94,12 @@ class CurationJob(BaseModel):
     created_at: datetime
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+    scheduled_for: Optional[datetime] = None
     exit_code: Optional[int] = None
     log_file: str
     config_file: str
     error_message: Optional[str] = None
+    output_format: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -212,6 +221,11 @@ async def _poll_jobs():
     while True:
         await asyncio.sleep(5)
         for job_id, job in list(_jobs.items()):
+            # Auto-start scheduled jobs whose time has arrived
+            if job.status in (JobStatus.PENDING, JobStatus.SCHEDULED) and job.scheduled_for:
+                if job.scheduled_for <= datetime.now():
+                    _start_job(job)
+                    continue
             if job.status != JobStatus.RUNNING:
                 continue
 
@@ -392,9 +406,10 @@ def create_job(req: CurationJobCreate) -> CurationJob:
 
     # Validate stages reference known types
     from stage_registry import get_text_stage_detail as _get_detail
+    from run_pipeline import _FILTER_CLASS_REGISTRY, _MODIFIER_CLASS_REGISTRY, _CLASSIFIER_CLASS_REGISTRY, _DEDUP_TYPES
 
     for stage in req.stages:
-        if _get_detail(stage.type) is None:
+        if _get_detail(stage.type) is None and stage.type not in _FILTER_CLASS_REGISTRY and stage.type not in _MODIFIER_CLASS_REGISTRY and stage.type not in _CLASSIFIER_CLASS_REGISTRY and stage.type not in _DEDUP_TYPES:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unknown stage type: {stage.type}",
@@ -415,23 +430,28 @@ def create_job(req: CurationJobCreate) -> CurationJob:
 
     log_file = LOGS_DIR / f"{job_id}.log"
 
+    scheduled_for = req.scheduled_for
+    if scheduled_for and scheduled_for <= datetime.now():
+        scheduled_for = None  # past time → treat as immediate
+
+    initial_status = JobStatus.SCHEDULED if scheduled_for else JobStatus.PENDING
+
     job = CurationJob(
         job_id=job_id,
         name=req.name,
-        status=JobStatus.PENDING,
+        status=initial_status,
         input_path=req.input_path,
         output_path=req.output_path,
         stages_count=len(req.stages),
         created_at=datetime.now(),
+        scheduled_for=scheduled_for,
         log_file=str(log_file),
         config_file=str(config_path),
+        output_format=req.output_format,
     )
 
     _jobs[job_id] = job
     _save_jobs()
-
-    # Start immediately (no approval gate for curation jobs)
-    _start_job(job)
 
     return _jobs[job_id]
 
@@ -484,14 +504,13 @@ async def get_job_logs(
     return StreamingResponse(generate(), media_type="text/plain")
 
 
-@app.delete("/api/jobs/{job_id}")
-def cancel_job(job_id: str):
-    """Cancel a running or pending curation job."""
+def _do_cancel(job_id: str) -> dict:
+    """Shared cancel logic for DELETE and POST cancel endpoints."""
     job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.status not in (JobStatus.RUNNING, JobStatus.PENDING):
-        raise HTTPException(status_code=400, detail="Job is not running or pending")
+    if job.status not in (JobStatus.RUNNING, JobStatus.PENDING, JobStatus.SCHEDULED):
+        raise HTTPException(status_code=400, detail="Job is not cancellable")
 
     proc = _processes.get(job_id)
     if proc:
@@ -505,8 +524,64 @@ def cancel_job(job_id: str):
     job.status = JobStatus.CANCELLED
     job.finished_at = datetime.now()
     _save_jobs()
-
     return {"status": "cancelled", "job_id": job_id}
+
+
+@app.delete("/api/jobs/{job_id}")
+def cancel_job(job_id: str):
+    """Cancel a running, pending, or scheduled curation job."""
+    return _do_cancel(job_id)
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job_post(job_id: str):
+    """Cancel a job (POST alias for schedule-page compatibility)."""
+    return _do_cancel(job_id)
+
+
+@app.post("/api/jobs/{job_id}/schedule")
+def schedule_job(job_id: str, body: ScheduleJobRequest):
+    """Set a future run time for a pending job."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status not in (JobStatus.PENDING, JobStatus.SCHEDULED):
+        raise HTTPException(status_code=400, detail="Job cannot be scheduled in its current state")
+
+    scheduled_dt = datetime.fromtimestamp(body.scheduled_for)
+    job.scheduled_for = scheduled_dt
+    job.status = JobStatus.SCHEDULED
+    _save_jobs()
+    return _jobs[job_id]
+
+
+@app.post("/api/jobs/{job_id}/unschedule")
+def unschedule_job(job_id: str):
+    """Remove the scheduled time from a job (returns it to pending)."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != JobStatus.SCHEDULED:
+        raise HTTPException(status_code=400, detail="Job is not scheduled")
+
+    job.scheduled_for = None
+    job.status = JobStatus.PENDING
+    _save_jobs()
+    return _jobs[job_id]
+
+
+@app.post("/api/jobs/{job_id}/approve")
+def approve_job(job_id: str):
+    """Start a pending or scheduled job immediately."""
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status not in (JobStatus.PENDING, JobStatus.SCHEDULED):
+        raise HTTPException(status_code=400, detail="Job is not pending or scheduled")
+
+    job.scheduled_for = None
+    _start_job(job)
+    return _jobs[job_id]
 
 
 # ─── Data Endpoint ──────────────────────────────────────────────────────
