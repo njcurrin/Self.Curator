@@ -91,12 +91,12 @@ class ModelStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 repo_id=self.model_identifier,
                 cache_dir=self.cache_dir,
                 token=self.hf_token,
-                local_files_only=False,
+                local_files_only=True,
             )
 
             _setup_function = getattr(self, "_setup", None)
             if callable(_setup_function):
-                _setup_function(local_files_only=False)
+                _setup_function(local_files_only=True)
             else:
                 logger.warning(f"Subclass {self.__class__.__name__} does not implement _setup method")
 

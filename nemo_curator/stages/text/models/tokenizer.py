@@ -97,9 +97,9 @@ class TokenizerStage(ProcessingStage[DocumentBatch, DocumentBatch]):
                 repo_id=self.model_identifier,
                 cache_dir=self.cache_dir,
                 token=self.hf_token,
-                local_files_only=False,
+                local_files_only=True,
             )
-            self._setup(local_files_only=False)
+            self._setup(local_files_only=True)
         except Exception as e:
             msg = f"Failed to download {self.model_identifier}"
             raise RuntimeError(msg) from e
