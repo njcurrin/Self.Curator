@@ -8,7 +8,7 @@ import json
 import os
 import subprocess
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -149,7 +149,7 @@ def _load_jobs():
                 if job.status == JobStatus.RUNNING:
                     job.status = JobStatus.FAILED
                     job.error_message = "Process lost on container restart"
-                    job.finished_at = datetime.now()
+                    job.finished_at = datetime.now(timezone.utc)
                 _jobs[job_id] = job
             except Exception as e:
                 print(f"Failed to load job {job_id}: {e}")
@@ -172,7 +172,7 @@ def _start_job(job: CurationJob) -> None:
     if not config_path.exists():
         job.status = JobStatus.FAILED
         job.error_message = f"Config file not found: {config_path}"
-        job.finished_at = datetime.now()
+        job.finished_at = datetime.now(timezone.utc)
         _save_jobs()
         return
 
@@ -182,7 +182,7 @@ def _start_job(job: CurationJob) -> None:
     except Exception as e:
         job.status = JobStatus.FAILED
         job.error_message = f"Failed to open log: {e}"
-        job.finished_at = datetime.now()
+        job.finished_at = datetime.now(timezone.utc)
         _save_jobs()
         return
 
@@ -205,13 +205,13 @@ def _start_job(job: CurationJob) -> None:
     except Exception as e:
         job.status = JobStatus.FAILED
         job.error_message = f"Failed to start pipeline: {e}"
-        job.finished_at = datetime.now()
+        job.finished_at = datetime.now(timezone.utc)
         _save_jobs()
         return
 
     job.status = JobStatus.RUNNING
     job.pid = proc.pid
-    job.started_at = datetime.now()
+    job.started_at = datetime.now(timezone.utc)
     _processes[job.job_id] = proc
     _save_jobs()
 
@@ -221,11 +221,6 @@ async def _poll_jobs():
     while True:
         await asyncio.sleep(5)
         for job_id, job in list(_jobs.items()):
-            # Auto-start scheduled jobs whose time has arrived
-            if job.status in (JobStatus.PENDING, JobStatus.SCHEDULED) and job.scheduled_for:
-                if job.scheduled_for <= datetime.now():
-                    _start_job(job)
-                    continue
             if job.status != JobStatus.RUNNING:
                 continue
 
@@ -236,7 +231,7 @@ async def _poll_jobs():
             rc = proc.poll()
             if rc is not None:
                 job.exit_code = rc
-                job.finished_at = datetime.now()
+                job.finished_at = datetime.now(timezone.utc)
                 job.status = (
                     JobStatus.COMPLETED if rc == 0 else JobStatus.FAILED
                 )
@@ -431,7 +426,7 @@ def create_job(req: CurationJobCreate) -> CurationJob:
     log_file = LOGS_DIR / f"{job_id}.log"
 
     scheduled_for = req.scheduled_for
-    if scheduled_for and scheduled_for <= datetime.now():
+    if scheduled_for and scheduled_for.timestamp() <= datetime.now(timezone.utc).timestamp():
         scheduled_for = None  # past time → treat as immediate
 
     initial_status = JobStatus.SCHEDULED if scheduled_for else JobStatus.PENDING
@@ -443,7 +438,7 @@ def create_job(req: CurationJobCreate) -> CurationJob:
         input_path=req.input_path,
         output_path=req.output_path,
         stages_count=len(req.stages),
-        created_at=datetime.now(),
+        created_at=datetime.now(timezone.utc),
         scheduled_for=scheduled_for,
         log_file=str(log_file),
         config_file=str(config_path),
@@ -522,7 +517,7 @@ def _do_cancel(job_id: str) -> dict:
         del _processes[job_id]
 
     job.status = JobStatus.CANCELLED
-    job.finished_at = datetime.now()
+    job.finished_at = datetime.now(timezone.utc)
     _save_jobs()
     return {"status": "cancelled", "job_id": job_id}
 
@@ -548,7 +543,7 @@ def schedule_job(job_id: str, body: ScheduleJobRequest):
     if job.status not in (JobStatus.PENDING, JobStatus.SCHEDULED):
         raise HTTPException(status_code=400, detail="Job cannot be scheduled in its current state")
 
-    scheduled_dt = datetime.fromtimestamp(body.scheduled_for)
+    scheduled_dt = datetime.fromtimestamp(body.scheduled_for, tz=timezone.utc)
     job.scheduled_for = scheduled_dt
     job.status = JobStatus.SCHEDULED
     _save_jobs()
