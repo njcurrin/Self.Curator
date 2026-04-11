@@ -1,10 +1,11 @@
 """
 Shared fixtures for self.ai curator API tests.
 
-Usage in sub-package conftest.py files:
-    pytest_plugins = ["selfai_conftest"]
+Sub-package conftest.py files import fixtures from here directly.
 """
 
+import os
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -132,3 +133,43 @@ def job_factory(temp_workspace):
         return job
 
     return _create
+
+
+# ── VRAM guard ─────────────────────────────────────────────────
+
+
+def _get_free_vram_mb() -> float:
+    """Query free GPU memory in MB. Returns 0 if no GPU available."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # Sum free memory across all GPUs
+            return sum(float(x) for x in result.stdout.strip().split("\n") if x.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return 0.0
+
+
+@pytest.fixture(autouse=True)
+def _vram_guard(request):
+    """Auto-skip gpu-marked tests if free VRAM is below threshold.
+
+    Threshold (in GB) is set via VRAM_THRESHOLD env var (default: 4).
+    Only applies to tests with the ``gpu`` marker.
+    """
+    marker = request.node.get_closest_marker("gpu")
+    if marker is None:
+        return  # Not a GPU test — no check
+
+    threshold_gb = float(os.environ.get("VRAM_THRESHOLD", "4"))
+    free_mb = _get_free_vram_mb()
+    free_gb = free_mb / 1024
+
+    if free_gb < threshold_gb:
+        pytest.skip(
+            f"Insufficient VRAM: {free_gb:.1f} GB free, "
+            f"{threshold_gb:.1f} GB required (set VRAM_THRESHOLD to override)"
+        )

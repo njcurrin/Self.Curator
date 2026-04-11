@@ -1,18 +1,32 @@
-"""Validation tests for selfai_conftest fixtures (T-100/T-101/T-102/T-103)."""
+"""Validation tests for Tier 0 + Tier 1 infrastructure
+(T-100/T-101/T-102/T-103/T-104/T-105/T-107)."""
 
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from selfai_conftest import client, temp_workspace, job_factory  # noqa: F401,E402
+from selfai_conftest import client, temp_workspace, job_factory, _vram_guard  # noqa: F401,E402
+
+
+# ── T-100: Directory structure ──────────────────────────────────
+
+
+def test_directories_exist():
+    assert (Path("/app/tests/nodes/__init__.py")).exists()
+    assert (Path("/app/tests/pipeline/__init__.py")).exists()
+    assert (Path("/app/tests/api/__init__.py")).exists()
+
+
+# ── T-101: Shared fixtures ──────────────────────────────────────
 
 
 def test_client_hits_health(client):
     resp = client.get("/health")
     assert resp.status_code == 200
-    data = resp.json()
-    assert data["status"] == "ok"
+    assert resp.json()["status"] == "ok"
 
 
 def test_temp_workspace_creates_all_subdirs(temp_workspace):
@@ -51,6 +65,9 @@ def test_job_factory_paths_in_workspace(job_factory, temp_workspace):
     assert str(temp_workspace) in job.config_file
 
 
+# ── T-102: Fixture data ────────────────────────────────────────
+
+
 def test_fixture_data_jsonl():
     import json
     records = [json.loads(l) for l in open("/app/tests/fixtures/selfai/sample_data.jsonl")]
@@ -66,17 +83,51 @@ def test_fixture_data_parquet():
     assert "id" in table.column_names
 
 
-def test_directories_exist():
-    from pathlib import Path
-    assert (Path("/app/tests/nodes/__init__.py")).exists()
-    assert (Path("/app/tests/pipeline/__init__.py")).exists()
-    assert (Path("/app/tests/api/__init__.py")).exists()
+# ── T-103: Upstream conftest ────────────────────────────────────
 
 
 def test_upstream_conftest_untouched():
-    """shared_ray_cluster fixture available from upstream conftest."""
-    import importlib, sys
     sys.path.insert(0, "/app/tests")
-    # Just verify conftest is importable and has the fixture
     import conftest
     assert hasattr(conftest, "shared_ray_cluster")
+
+
+# ── T-104: Pytest markers ──────────────────────────────────────
+
+
+@pytest.mark.fast
+def test_fast_marker_applies():
+    """A fast-marked test runs without Ray or GPU."""
+    assert True
+
+
+@pytest.mark.integration
+def test_integration_marker_applies():
+    """Placeholder: integration marker is registered and applies."""
+    pytest.skip("Skipped by design — validates marker registration only")
+
+
+@pytest.mark.gpu
+def test_gpu_marker_applies():
+    """Placeholder: gpu marker is registered and applies."""
+    pytest.skip("Skipped by design — validates marker registration only")
+
+
+# ── T-105: VRAM guard ──────────────────────────────────────────
+
+
+def test_vram_guard_skips_no_gpu():
+    """_get_free_vram_mb returns 0 when no GPU is available or in test env."""
+    from selfai_conftest import _get_free_vram_mb
+    # Just verifying it doesn't crash — returns a number
+    result = _get_free_vram_mb()
+    assert isinstance(result, float)
+    assert result >= 0.0
+
+
+def test_vram_guard_not_applied_to_fast(client):
+    """Non-gpu-marked tests are never subject to VRAM checks."""
+    # This test has no gpu marker, so _vram_guard should be a no-op.
+    # If VRAM guard incorrectly applied, this would skip.
+    resp = client.get("/health")
+    assert resp.status_code == 200

@@ -96,9 +96,10 @@ RUN mkdir -p /workspace/curator/data \
              /workspace/curator/cache/hf-hub \
              /workspace/curator/custom_stages
 
-# Copy API code and tests
+# Copy API code, tests, and pytest config
 COPY api/ /app/api/
 COPY tests/ /app/tests/
+COPY pytest.ini /app/pytest.ini
 
 # supervisord configuration
 COPY supervisord.conf /etc/supervisor/conf.d/curator.conf
