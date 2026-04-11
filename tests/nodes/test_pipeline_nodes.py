@@ -2,17 +2,20 @@
 """
 End-to-end registry tests for built-in pipeline nodes.
 
+Migrated from tests/api/test_pipeline_nodes.py to tests/nodes/ (T-106).
+All tests marked fast — no Ray cluster, no disk I/O, no subprocess.
+
 These tests verify that each node type the UI can produce (filter or modifier)
 can be instantiated through the same registry path used by run_pipeline.py, and
 that the resulting stage transforms data correctly when .process() is called.
-
-No Ray cluster, no disk I/O, no subprocess — just the registry logic and stage execution.
 """
 
 import importlib.util
 
 import pandas as pd
 import pytest
+
+pytestmark = pytest.mark.fast
 
 from nemo_curator.stages.text.filters.score_filter import ScoreFilter
 from nemo_curator.stages.text.modifiers.modifier import Modify
