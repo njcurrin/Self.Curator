@@ -1,7 +1,6 @@
 import sys
 from pathlib import Path
 
-# Make api/ and tests/ importable
 sys.path.insert(0, "/app/api")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
