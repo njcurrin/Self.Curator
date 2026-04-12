@@ -206,7 +206,14 @@ class TestStageDiscoveryDetail:
 class TestCustomStageCRUD:
     """R3: Custom stage CRUD. save_custom_stage() now validates via
     _load_stage_from_file() (direct filepath) instead of the index-based
-    _load_custom_stage_class, which required an entry that didn't yet exist."""
+    _load_custom_stage_class, which required an entry that didn't yet exist.
+
+    SECURITY NOTE (R12): These endpoints write user-submitted Python
+    to disk and exec it inside the curator container WITH NO SANDBOX.
+    The curator API MUST remain on an internal-only Docker network;
+    any deployment exposing port 8094 externally must add an auth
+    proxy in front. Sandboxing is deferred work — see MEMORY.md
+    `Plugin Sandbox Deferred` and cavekit-curator-api-contract R12."""
     def test_create_returns_201(self, client, temp_workspace):
         resp = client.post("/api/text/custom/stages", json={
             "name": "TestStage", "category": "filters", "code": _stage_code()
@@ -607,6 +614,95 @@ class TestScheduledNonAutoStart:
 
 
 # ===========================================================================
+# R13: _poll_jobs direct invocation tests
+# ===========================================================================
+
+class TestPollJobsDirectInvocation:
+    """R13 (added by /ck:check revision): verify the actual _poll_jobs
+    behavior by running a single iteration directly. Previous R8 tests
+    never invoked the poll loop — they were vacuous."""
+
+    def test_poll_once_does_not_start_scheduled(self, temp_workspace, job_factory):
+        """Invoking _poll_jobs_once() against a past-due SCHEDULED job
+        leaves it SCHEDULED (no auto-start). Self.UI daemon owns start."""
+        import main as main_module
+        from main import JobStatus
+        past = datetime.now(timezone.utc) - timedelta(hours=1)
+        job = job_factory(status=JobStatus.SCHEDULED, scheduled_for=past)
+
+        main_module._poll_jobs_once()
+
+        assert main_module._jobs[job.job_id].status == JobStatus.SCHEDULED
+        assert main_module._jobs[job.job_id].started_at is None
+
+    def test_poll_once_transitions_completed_running_jobs(self, temp_workspace, job_factory):
+        """Positive control: the poll loop DOES transition RUNNING jobs
+        whose subprocess has exited. Proves the poll is actually doing
+        something (not a no-op)."""
+        import main as main_module
+        from main import JobStatus
+
+        job = job_factory(status=JobStatus.RUNNING)
+        Path(job.log_file).write_text("pipeline done\n")
+
+        # Mock a completed subprocess: poll() returns 0
+        class _DoneProc:
+            pid = 12345
+            def poll(self):
+                return 0
+
+        main_module._processes[job.job_id] = _DoneProc()
+
+        main_module._poll_jobs_once()
+
+        assert main_module._jobs[job.job_id].status == JobStatus.COMPLETED
+        assert main_module._jobs[job.job_id].exit_code == 0
+        assert main_module._jobs[job.job_id].finished_at is not None
+        assert job.job_id not in main_module._processes
+
+    def test_poll_once_transitions_failed_running_jobs(self, temp_workspace, job_factory):
+        """Running job whose subprocess exited nonzero → FAILED."""
+        import main as main_module
+        from main import JobStatus
+
+        job = job_factory(status=JobStatus.RUNNING)
+        Path(job.log_file).write_text("some error line\n")
+
+        class _FailProc:
+            pid = 54321
+            def poll(self):
+                return 2
+
+        main_module._processes[job.job_id] = _FailProc()
+
+        main_module._poll_jobs_once()
+
+        assert main_module._jobs[job.job_id].status == JobStatus.FAILED
+        assert main_module._jobs[job.job_id].exit_code == 2
+        assert main_module._jobs[job.job_id].error_message is not None
+
+    def test_poll_once_leaves_running_alone_if_subprocess_still_running(
+        self, temp_workspace, job_factory
+    ):
+        """Running job whose subprocess is still live → no state change."""
+        import main as main_module
+        from main import JobStatus
+
+        job = job_factory(status=JobStatus.RUNNING)
+
+        class _AliveProc:
+            pid = 99999
+            def poll(self):
+                return None  # still running
+
+        main_module._processes[job.job_id] = _AliveProc()
+
+        main_module._poll_jobs_once()
+
+        assert main_module._jobs[job.job_id].status == JobStatus.RUNNING
+
+
+# ===========================================================================
 # T-120: R9 Job Logs
 # ===========================================================================
 
@@ -669,6 +765,23 @@ class TestErrorResponseContract:
         assert "detail" in resp.json()
         assert isinstance(resp.json()["detail"], str)
 
+    def test_400_has_detail(self, client, temp_workspace):
+        """400 (invalid input_path) includes a detail key with a human-readable message."""
+        resp = client.post("/api/jobs", json=_job_create_body("/nonexistent/file.jsonl"))
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "detail" in body
+        assert isinstance(body["detail"], str)
+        assert len(body["detail"]) > 0
+
+    def test_422_has_detail(self, client, temp_workspace):
+        """422 (Pydantic validation) includes detail (Pydantic default format)."""
+        resp = client.post("/api/jobs", content="not json",
+                            headers={"content-type": "application/json"})
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "detail" in body
+
     def test_invalid_json_422(self, client, temp_workspace):
         resp = client.post("/api/jobs", content="not json", headers={"content-type": "application/json"})
         assert resp.status_code == 422
@@ -703,7 +816,13 @@ class TestConcurrentStateSafety:
     """R11: _save_jobs() is now thread-safe via a module-level lock plus
     per-call unique tmp filenames. (Previously: FileNotFoundError under
     concurrent writes due to shared .tmp file.)"""
-    def test_concurrent_creates_unique_ids(self, client, temp_workspace):
+    def test_concurrent_creates_do_not_crash(self, client, temp_workspace):
+        """10 threaded POSTs do not raise FileNotFoundError on rename.
+
+        Without the _save_jobs() lock + unique tmp fix, the shared .tmp
+        file causes one thread's `tmp.replace(STATE_FILE)` to win while
+        the loser raises FileNotFoundError.
+        """
         inp = _create_input_file(temp_workspace)
         results = []
         errors = []
@@ -725,6 +844,37 @@ class TestConcurrentStateSafety:
         assert len(results) == 10
         job_ids = {r["job_id"] for r in results}
         assert len(job_ids) == 10, "Not all job IDs are unique"
+
+    def test_save_jobs_directly_threaded(self, temp_workspace, job_factory):
+        """Companion to the TestClient-based test: exercise _save_jobs()
+        directly from N threads and verify jobs.json round-trips cleanly.
+        This proves the lock — if removed, the tmp.replace race fires
+        repeatedly."""
+        import main as main_module
+        # Pre-populate with distinct jobs
+        for i in range(20):
+            job_factory(name=f"lock-{i}")
+
+        errors = []
+
+        def do_save():
+            try:
+                main_module._save_jobs()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=do_save) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"_save_jobs() raised under concurrency: {errors}"
+        state_file = main_module.JOBS_STATE_FILE
+        assert state_file.exists()
+        data = json.loads(state_file.read_text())
+        assert isinstance(data, dict)
+        assert len(data) == 20
 
     def test_concurrent_read_during_write(self, client, temp_workspace):
         inp = _create_input_file(temp_workspace)

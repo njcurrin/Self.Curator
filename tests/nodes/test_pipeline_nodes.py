@@ -520,6 +520,26 @@ class TestDetectFiletype:
         (tmp_path / "b.parquet").write_bytes(b"PAR1")
         assert _detect_filetype(str(tmp_path)) == "jsonl"
 
+    # R12 regression tests: file-path branch (previously untested — fix
+    # was trivially revertible without breaking directory-only tests).
+
+    def test_detects_jsonl_file_path(self, tmp_path):
+        f = tmp_path / "data.jsonl"
+        f.write_text('{"text": "x"}\n')
+        assert _detect_filetype(str(f)) == "jsonl"
+
+    def test_detects_parquet_file_path(self, tmp_path):
+        f = tmp_path / "data.parquet"
+        f.write_bytes(b"PAR1")
+        assert _detect_filetype(str(f)) == "parquet"
+
+    def test_nonexistent_path_raises(self, tmp_path):
+        """Finding F-005: silently returning 'parquet' for missing paths
+        produced confusing downstream errors. Now raises FileNotFoundError."""
+        import pytest
+        with pytest.raises(FileNotFoundError):
+            _detect_filetype(str(tmp_path / "does_not_exist.jsonl"))
+
 
 class TestDedupStageSplitting:
     """Verify the main() routing logic: dedup stages are split from stream stages."""

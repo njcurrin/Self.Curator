@@ -127,9 +127,28 @@ def _ensure_dirs():
         d.mkdir(parents=True, exist_ok=True)
 
 
+def _cleanup_orphan_tmp_files():
+    """Remove leftover jobs.*.tmp files from aborted _save_jobs() writes.
+
+    _save_jobs() uses per-call unique tmp filenames to avoid the race
+    between concurrent writers. On SIGKILL / OOM / container crash
+    between write_text and replace, the .tmp file survives. This
+    sweep runs at startup so the jobs directory doesn't accumulate.
+    """
+    if not JOBS_DIR.exists():
+        return
+    stem = JOBS_STATE_FILE.stem  # "jobs"
+    for p in JOBS_DIR.glob(f"{stem}.*.tmp"):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
 def _load_jobs():
     """Load job state from JSON file."""
     global _jobs
+    _cleanup_orphan_tmp_files()
     if JOBS_STATE_FILE.exists():
         data = json.loads(JOBS_STATE_FILE.read_text())
         for job_id, job_data in data.items():
@@ -227,34 +246,48 @@ def _start_job(job: CurationJob) -> None:
     _save_jobs()
 
 
+def _poll_jobs_once():
+    """Run a single iteration of the poll loop.
+
+    Checks every RUNNING job for subprocess completion and transitions
+    it to COMPLETED / FAILED. Scheduled jobs are intentionally NOT
+    touched here — the self.UI daemon is responsible for approving
+    scheduled jobs when their time arrives.
+
+    Extracted from `_poll_jobs()` so tests can exercise the poll
+    behavior without the infinite `await asyncio.sleep(5)` loop.
+    """
+    for job_id, job in list(_jobs.items()):
+        if job.status != JobStatus.RUNNING:
+            continue
+
+        proc = _processes.get(job_id)
+        if not proc:
+            continue
+
+        rc = proc.poll()
+        if rc is not None:
+            job.exit_code = rc
+            job.finished_at = datetime.now(timezone.utc)
+            job.status = (
+                JobStatus.COMPLETED if rc == 0 else JobStatus.FAILED
+            )
+            if rc != 0:
+                try:
+                    log_lines = Path(job.log_file).read_text().splitlines()
+                    tail = "\n".join(log_lines[-10:])
+                    job.error_message = f"Process exited with code {rc}. Tail:\n{tail}"
+                except Exception:
+                    job.error_message = f"Process exited with code {rc}"
+            del _processes[job_id]
+            _save_jobs()
+
+
 async def _poll_jobs():
     """Background task: poll job subprocess status every 5 seconds."""
     while True:
         await asyncio.sleep(5)
-        for job_id, job in list(_jobs.items()):
-            if job.status != JobStatus.RUNNING:
-                continue
-
-            proc = _processes.get(job_id)
-            if not proc:
-                continue
-
-            rc = proc.poll()
-            if rc is not None:
-                job.exit_code = rc
-                job.finished_at = datetime.now(timezone.utc)
-                job.status = (
-                    JobStatus.COMPLETED if rc == 0 else JobStatus.FAILED
-                )
-                if rc != 0:
-                    try:
-                        log_lines = Path(job.log_file).read_text().splitlines()
-                        tail = "\n".join(log_lines[-10:])
-                        job.error_message = f"Process exited with code {rc}. Tail:\n{tail}"
-                    except Exception:
-                        job.error_message = f"Process exited with code {rc}"
-                del _processes[job_id]
-                _save_jobs()
+        _poll_jobs_once()
 
 
 # ─── Startup ────────────────────────────────────────────────────────────

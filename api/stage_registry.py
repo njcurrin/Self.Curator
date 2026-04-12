@@ -359,6 +359,21 @@ def save_custom_stage(name: str, category: str, code: str) -> dict[str, Any]:
             "Ensure it inherits from ProcessingStage and implements process()."
         )
 
+    # Reject duplicate class names across custom stages. _STAGE_REGISTRY is
+    # keyed by class.__name__, so two custom stages with the same class name
+    # would silently fail on subsequent loads (before/after diff sees no new
+    # class). Better to refuse the second submission upfront with a clear
+    # error than to surface the misleading "did not register" message later.
+    existing_index = _load_custom_index()
+    for uid, entry in existing_index.items():
+        if entry.get("class_name") == cls.__name__:
+            filepath.unlink(missing_ok=True)
+            raise ValueError(
+                f"Class name '{cls.__name__}' conflicts with existing custom "
+                f"stage '{entry['name']}' (id: {uid}). Rename the class in "
+                f"your code to avoid the conflict."
+            )
+
     # Introspect inputs/outputs for the node graph
     try:
         instance = cls.__new__(cls)

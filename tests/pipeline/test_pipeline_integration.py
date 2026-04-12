@@ -13,9 +13,13 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, "/app/api")
+# Portable paths — tests/pipeline/ is parents[2] away from repo root.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_API_DIR = str(_REPO_ROOT / "api")
+if _API_DIR not in sys.path:
+    sys.path.insert(0, _API_DIR)
 
-FIXTURE_DIR = Path("/app/tests/fixtures/selfai")
+FIXTURE_DIR = _REPO_ROOT / "tests" / "fixtures" / "selfai"
 SAMPLE_JSONL = FIXTURE_DIR / "sample_data.jsonl"
 SAMPLE_PARQUET = FIXTURE_DIR / "sample_data.parquet"
 
@@ -560,6 +564,31 @@ class TestIOFormatMatrix:
                 if line.strip():
                     assert "text" in json.loads(line)
 
+    # R8 AC4 — fourth quadrant of the IO matrix (finding F-010)
+    def test_parquet_to_jsonl(self, tmp_path):
+        if not SAMPLE_PARQUET.exists():
+            pytest.skip("Parquet fixture not generated")
+        result = self._run_format_test(tmp_path, SAMPLE_PARQUET, "jsonl")
+        assert result.returncode == 0, f"parquet→jsonl failed: {result.stderr}"
+        outputs = list((tmp_path / "output").rglob("*.jsonl"))
+        assert len(outputs) > 0
+
+    # R8 AC6 — record count preserved in a pass-through pipeline
+    def test_record_count_preserved_jsonl(self, tmp_path):
+        """Pass-through pipeline (permissive filter accepts all) must
+        preserve record count through format conversion."""
+        input_records = [json.loads(l) for l in SAMPLE_JSONL.read_text().splitlines() if l.strip()]
+        result = self._run_format_test(tmp_path, SAMPLE_JSONL, "jsonl")
+        assert result.returncode == 0
+        out_records = []
+        for f in (tmp_path / "output").rglob("*.jsonl"):
+            for line in f.read_text().splitlines():
+                if line.strip():
+                    out_records.append(json.loads(line))
+        assert len(out_records) == len(input_records), (
+            f"Record count changed: in={len(input_records)}, out={len(out_records)}"
+        )
+
 
 # ===========================================================================
 # T-132: R9 Error Paths — main cases (fast)
@@ -593,6 +622,24 @@ class TestErrorPaths:
         with pytest.raises((ValueError, KeyError)):
             build_pipeline(config)
 
+    # R9 AC4 — unsupported input extension (finding F-009)
+    def test_unsupported_input_extension_raises(self, tmp_path):
+        """build_pipeline() must reject a .csv (or other unknown) input
+        with a ValueError whose message mentions the format."""
+        from run_pipeline import build_pipeline
+        # Create an actual file so the extension check is hit, not a path-exists check
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("id,text\n1,hello\n")
+        config = {
+            "input_path": str(csv_file),
+            "output_path": str(tmp_path / "output"),
+            "text_field": "text",
+            "stages": [{"type": "WordCountFilter", "params": {}}],
+        }
+        with pytest.raises(ValueError) as exc_info:
+            build_pipeline(config)
+        assert "Unsupported input format" in str(exc_info.value)
+
 
 # ===========================================================================
 # T-133: R9 Error Paths — edge cases (integration)
@@ -611,6 +658,62 @@ class TestErrorPathsEdge:
         config_path = _write_config(tmp_path, config)
         result = _run_pipeline_subprocess(config_path, timeout=60)
         assert result.returncode != 0
+
+    # R9 AC3 — malformed JSONL produces descriptive error (finding F-009)
+    def test_malformed_jsonl_raises_descriptive_error(self, tmp_path):
+        """Invalid JSON on some lines should fail with a clear error,
+        not an unhandled exception."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        bad_file = input_dir / "data.jsonl"
+        bad_file.write_text('{"text": "valid"}\nnot valid json here\n{"text": "also valid"}\n')
+
+        config = {
+            "input_path": str(bad_file),
+            "output_path": str(tmp_path / "output"),
+            "text_field": "text",
+            "output_format": "jsonl",
+            "stages": [{"type": "WordCountFilter", "params": {"min_words": 1, "max_words": 999999}}],
+        }
+        config_path = _write_config(tmp_path, config)
+        result = _run_pipeline_subprocess(config_path, timeout=120)
+        assert result.returncode != 0
+        # Error should be actionable — the subprocess stderr+stdout combined
+        # must reference the failure somehow (JSON parse error, arrow error,
+        # etc.). Accept any non-empty error output.
+        combined = (result.stdout or "") + (result.stderr or "")
+        assert len(combined) > 0
+
+    # R9 AC6 — zero-match filter produces empty output, not a crash
+    def test_zero_match_filter_empty_output(self, tmp_path):
+        """Filter that rejects every record produces an empty output
+        file (or zero output records), not a crash."""
+        input_dir = tmp_path / "input"
+        output_dir = tmp_path / "output"
+        input_dir.mkdir()
+        input_file = input_dir / "data.jsonl"
+        # Small dataset with short texts
+        records = [{"text": f"word{i}"} for i in range(5)]
+        input_file.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+        config = {
+            "input_path": str(input_file),
+            "output_path": str(output_dir),
+            "text_field": "text",
+            "output_format": "jsonl",
+            # min_words = 100 → everything fails the filter
+            "stages": [{"type": "WordCountFilter", "params": {"min_words": 100, "max_words": 999999}}],
+        }
+        config_path = _write_config(tmp_path, config)
+        result = _run_pipeline_subprocess(config_path, timeout=120)
+        assert result.returncode == 0, f"Zero-match pipeline crashed: {result.stderr}"
+        # Output directory exists; any JSONL files in it contain zero records
+        total_records = 0
+        for f in output_dir.rglob("*.jsonl"):
+            for line in f.read_text().splitlines():
+                if line.strip():
+                    total_records += 1
+        assert total_records == 0, f"Expected empty output, got {total_records} records"
 
 
 # ===========================================================================

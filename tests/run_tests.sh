@@ -20,9 +20,12 @@ fi
 JUNIT_PATH="/app/tests/results/junit.xml"
 mkdir -p "$(dirname "$JUNIT_PATH")"
 
-MARKER_ARG=""
+# Build marker args as an array so multi-word expressions
+# (e.g., TEST_MARKERS="not gpu") are passed as a single -m argument
+# instead of word-splitting into separate pytest paths.
+MARKER_ARGS=()
 if [ -n "${TEST_MARKERS:-}" ]; then
-    MARKER_ARG="-m ${TEST_MARKERS}"
+    MARKER_ARGS=(-m "${TEST_MARKERS}")
 fi
 
 # Run only self.ai test sub-packages (not upstream NeMo Curator tests)
@@ -31,7 +34,7 @@ exec python3 -m pytest \
     tests/nodes/ \
     tests/pipeline/ \
     tests/test_selfai_fixtures.py \
-    ${MARKER_ARG} \
+    "${MARKER_ARGS[@]}" \
     --junitxml="$JUNIT_PATH" \
     -v \
     "$@"

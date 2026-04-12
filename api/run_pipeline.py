@@ -268,7 +268,10 @@ def _detect_filetype(path: str) -> str:
       - a file path (uses the extension)
       - a directory path (scans for .jsonl/.parquet files)
 
-    Defaults to "parquet" if nothing is detected.
+    Raises FileNotFoundError for nonexistent paths so the caller
+    surfaces a clear error instead of silently defaulting to "parquet"
+    (which produced confusing "Parquet magic bytes not found" errors
+    downstream in NeMo Curator).
     """
     import glob
     p = Path(path)
@@ -277,12 +280,20 @@ def _detect_filetype(path: str) -> str:
             return "jsonl"
         if str(p).endswith(".parquet"):
             return "parquet"
+        # File exists but unknown extension — keep the "parquet" default
+        # so callers that have already validated the extension upstream
+        # don't regress. build_pipeline() rejects unknown extensions before
+        # reaching here.
+        return "parquet"
     if p.is_dir():
         if glob.glob(os.path.join(str(p), "*.jsonl")):
             return "jsonl"
         if glob.glob(os.path.join(str(p), "*.parquet")):
             return "parquet"
-    return "parquet"
+        # Empty directory — default to parquet (nothing to detect).
+        return "parquet"
+    # Path does not exist: don't silently mislabel as parquet.
+    raise FileNotFoundError(f"Input path does not exist: {path}")
 
 
 def run_exact_dedup(input_path: str, output_path: str, cache_path: str,
@@ -443,10 +454,12 @@ def main():
                     **params,
                 )
 
-            # Clean up intermediate
+            # Clean up intermediate + dedup cache (both are transient)
+            import shutil
             if stream_stages and os.path.exists(intermediate_path):
-                import shutil
-                shutil.rmtree(intermediate_path)
+                shutil.rmtree(intermediate_path, ignore_errors=True)
+            if os.path.exists(cache_path):
+                shutil.rmtree(cache_path, ignore_errors=True)
 
         else:
             # Normal streaming-only pipeline (no dedup)
