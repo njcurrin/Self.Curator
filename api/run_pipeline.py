@@ -299,6 +299,7 @@ def _detect_filetype(path: str) -> str:
 def run_exact_dedup(input_path: str, output_path: str, cache_path: str,
                     text_field: str = "text", assign_id: bool = True) -> None:
     """Two-phase exact dedup: ID identification + document removal."""
+    import glob
     import os
     import shutil
     from nemo_curator.stages.deduplication.exact.workflow import ExactDeduplicationWorkflow
@@ -329,6 +330,24 @@ def run_exact_dedup(input_path: str, output_path: str, cache_path: str,
     )
     id_result = id_workflow.run(executor=executor)
     id_generator_path = id_result.metadata.get("id_generator_path") if assign_id else None
+
+    # Zero-duplicate shortcut: if identification wrote no parquets, the
+    # ExactDuplicateIds subdir may be missing or empty. Phase B's
+    # pandas.read_parquet() would raise on that. Handle by copying the
+    # input verbatim to output_path and skipping phase B.
+    removal_parquets = glob.glob(os.path.join(ids_path, "*.parquet")) if os.path.isdir(ids_path) else []
+    if not removal_parquets:
+        logger.info("No exact duplicates found — copying input to output unchanged.")
+        os.makedirs(output_path, exist_ok=True)
+        if os.path.isfile(input_path):
+            shutil.copy(input_path, output_path)
+        elif os.path.isdir(input_path):
+            for name in os.listdir(input_path):
+                src = os.path.join(input_path, name)
+                if os.path.isfile(src):
+                    shutil.copy(src, output_path)
+        logger.info(f"ExactDedup complete (no-op) → {output_path}")
+        return
 
     # Phase B: remove duplicates → write clean data to output_path.
     #
@@ -461,29 +480,32 @@ def main():
             cache_path = config["output_path"] + "_dedup_cache"
             os.makedirs(cache_path, exist_ok=True)
 
-            if dedup_cfg["type"] == "ExactDedup":
-                run_exact_dedup(
-                    input_path=stream_input,
-                    output_path=config["output_path"],
-                    cache_path=cache_path,
-                    text_field=text_field,
-                    **params,
-                )
-            elif dedup_cfg["type"] == "FuzzyDedup":
-                run_fuzzy_dedup(
-                    input_path=stream_input,
-                    output_path=config["output_path"],
-                    cache_path=cache_path,
-                    text_field=text_field,
-                    **params,
-                )
-
-            # Clean up intermediate + dedup cache (both are transient)
-            import shutil
-            if stream_stages and os.path.exists(intermediate_path):
-                shutil.rmtree(intermediate_path, ignore_errors=True)
-            if os.path.exists(cache_path):
-                shutil.rmtree(cache_path, ignore_errors=True)
+            try:
+                if dedup_cfg["type"] == "ExactDedup":
+                    run_exact_dedup(
+                        input_path=stream_input,
+                        output_path=config["output_path"],
+                        cache_path=cache_path,
+                        text_field=text_field,
+                        **params,
+                    )
+                elif dedup_cfg["type"] == "FuzzyDedup":
+                    run_fuzzy_dedup(
+                        input_path=stream_input,
+                        output_path=config["output_path"],
+                        cache_path=cache_path,
+                        text_field=text_field,
+                        **params,
+                    )
+            finally:
+                # Cleanup runs on both success and failure — transient
+                # cache and intermediate dirs should never leak to disk
+                # across pipeline retries (finding F-103).
+                import shutil
+                if stream_stages and os.path.exists(intermediate_path):
+                    shutil.rmtree(intermediate_path, ignore_errors=True)
+                if os.path.exists(cache_path):
+                    shutil.rmtree(cache_path, ignore_errors=True)
 
         else:
             # Normal streaming-only pipeline (no dedup)

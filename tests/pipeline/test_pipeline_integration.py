@@ -50,14 +50,18 @@ def _write_small_jsonl(path, records=None):
 
 
 def _run_pipeline_subprocess(config_path, timeout=120):
-    """Run run_pipeline.py as a subprocess."""
+    """Run run_pipeline.py as a subprocess using portable repo-root paths
+    (finding F-104). The curator image still installs the NeMo Curator
+    package at /opt/Curator which stays on PYTHONPATH regardless of
+    where tests run from."""
     env = os.environ.copy()
     env["PYTHONPATH"] = f"/opt/Curator:{env.get('PYTHONPATH', '')}"
     env["PYTHONUNBUFFERED"] = "1"
+    run_pipeline_py = _REPO_ROOT / "api" / "run_pipeline.py"
     return subprocess.run(
-        [sys.executable, "/app/api/run_pipeline.py", str(config_path)],
+        [sys.executable, str(run_pipeline_py), str(config_path)],
         capture_output=True, text=True, timeout=timeout,
-        env=env, cwd="/app",
+        env=env, cwd=str(_REPO_ROOT),
     )
 
 
@@ -397,6 +401,44 @@ class TestExactDedup:
         # 5 unique texts survive; 3 duplicates removed
         assert len(out_records) < 8
         assert len(out_records) >= 5
+
+    def test_zero_duplicates_produces_passthrough_output(self, tmp_path):
+        """Finding F-102: input with zero duplicates must produce output
+        equal to input without erroring on the (possibly empty)
+        ExactDuplicateIds subdirectory."""
+        input_dir = tmp_path / "input"
+        output_dir = tmp_path / "output"
+        input_dir.mkdir()
+        input_file = input_dir / "data.jsonl"
+        records = [
+            {"text": "First completely unique sentence about weather."},
+            {"text": "Second completely unique sentence about music."},
+            {"text": "Third completely unique sentence about history."},
+            {"text": "Fourth completely unique sentence about cooking."},
+        ]
+        with open(input_file, "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+        config = {
+            "input_path": str(input_file),
+            "output_path": str(output_dir),
+            "text_field": "text",
+            "output_format": "jsonl",
+            "stages": [{"type": "ExactDedup", "params": {}}],
+        }
+        config_path = _write_config(tmp_path, config)
+        result = _run_pipeline_subprocess(config_path, timeout=180)
+        assert result.returncode == 0, f"Zero-dup ExactDedup failed: {result.stderr}"
+
+        out_records = []
+        for f in output_dir.rglob("*.jsonl"):
+            for line in f.read_text().splitlines():
+                if line.strip():
+                    out_records.append(json.loads(line))
+
+        # All 4 unique records preserved
+        assert len(out_records) == 4
 
 
 # ===========================================================================
