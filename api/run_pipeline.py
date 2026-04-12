@@ -210,7 +210,9 @@ def build_pipeline(config: dict):
     # Add user-configured processing stages
     for stage_config in config.get("stages", []):
         stage_type = stage_config["type"]
-        stage_params = stage_config.get("params", {})
+        # Copy params dict so .pop() in the modifier branch does not mutate
+        # the caller's config (which may be inspected or serialized later).
+        stage_params = dict(stage_config.get("params", {}))
 
         if stage_type in _FILTER_CLASS_REGISTRY:
             filter_cls = _FILTER_CLASS_REGISTRY[stage_type]

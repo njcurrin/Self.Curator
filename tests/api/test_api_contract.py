@@ -203,19 +203,10 @@ class TestStageDiscoveryDetail:
 # T-111: R3 Custom Stage CRUD lifecycle
 # ===========================================================================
 
-@pytest.mark.xfail(
-    reason="BUG (DISCOVERED BY TESTS): save_custom_stage() calls "
-    "_load_custom_stage_class(stage_uuid) BEFORE adding the entry to "
-    "the index. _load_custom_stage_class checks `index.get(stage_uuid)` "
-    "and returns None on missing entry — so every custom stage create "
-    "fails with 'Code must define exactly one concrete ProcessingStage "
-    "subclass'. Fix: update save_custom_stage to either (a) pre-populate "
-    "a placeholder index entry before validation, or (b) rewrite "
-    "_load_custom_stage_class to accept filepath directly for "
-    "validation. See stage_registry.py:348 and stage_registry.py:258-261.",
-    strict=False,
-)
 class TestCustomStageCRUD:
+    """R3: Custom stage CRUD. save_custom_stage() now validates via
+    _load_stage_from_file() (direct filepath) instead of the index-based
+    _load_custom_stage_class, which required an entry that didn't yet exist."""
     def test_create_returns_201(self, client, temp_workspace):
         resp = client.post("/api/text/custom/stages", json={
             "name": "TestStage", "category": "filters", "code": _stage_code()
@@ -512,32 +503,42 @@ class TestJobStateMachineInvalid:
 # T-117: R6 BUG — output_format not in config JSON
 # ===========================================================================
 
-class TestOutputFormatBug:
+class TestOutputFormatFix:
+    """R6: output_format is now correctly persisted to the subprocess config
+    JSON on disk. (Previously: bug in main.py create_job() omitted it.)"""
+
     def test_parquet_format_in_config_file(self, client, temp_workspace):
-        """BUG: output_format is NOT written to the config JSON on disk.
-        This test documents the current broken behavior. When fixed,
-        the assertion should be changed to verify output_format IS present."""
         inp = _create_input_file(temp_workspace)
         data = client.post("/api/jobs", json=_job_create_body(
             inp, output_format="parquet"
         )).json()
-        config_path = Path(data["config_file"])
-        config = json.loads(config_path.read_text())
-        # BUG: output_format is missing from config dict (main.py ~line 416)
-        assert "output_format" not in config, (
-            "output_format is now in the config — the bug may be fixed! "
-            "Update this test to assert it IS present."
-        )
+        config = json.loads(Path(data["config_file"]).read_text())
+        assert config.get("output_format") == "parquet"
 
-    def test_config_has_core_fields(self, client, temp_workspace):
+    def test_jsonl_format_in_config_file(self, client, temp_workspace):
+        inp = _create_input_file(temp_workspace)
+        data = client.post("/api/jobs", json=_job_create_body(
+            inp, output_format="jsonl"
+        )).json()
+        config = json.loads(Path(data["config_file"]).read_text())
+        assert config.get("output_format") == "jsonl"
+
+    def test_null_format_in_config_file(self, client, temp_workspace):
+        """No output_format → null in config (run_pipeline.py applies default)."""
         inp = _create_input_file(temp_workspace)
         data = client.post("/api/jobs", json=_job_create_body(inp)).json()
         config = json.loads(Path(data["config_file"]).read_text())
-        for key in ("name", "input_path", "output_path", "text_field", "stages"):
+        # Key present with null OR key absent are both acceptable
+        assert config.get("output_format") is None
+
+    def test_config_has_all_request_fields(self, client, temp_workspace):
+        inp = _create_input_file(temp_workspace)
+        data = client.post("/api/jobs", json=_job_create_body(inp, output_format="parquet")).json()
+        config = json.loads(Path(data["config_file"]).read_text())
+        for key in ("name", "input_path", "output_path", "text_field", "stages", "output_format"):
             assert key in config, f"Config missing key: {key}"
 
     def test_job_model_has_output_format(self, client, temp_workspace):
-        """The job model stores output_format correctly — only the config file is broken."""
         inp = _create_input_file(temp_workspace)
         data = client.post("/api/jobs", json=_job_create_body(
             inp, output_format="parquet"
@@ -698,17 +699,10 @@ class TestErrorResponseContract:
 # T-122: R11 Concurrent State Safety
 # ===========================================================================
 
-@pytest.mark.xfail(
-    reason="BUG (DISCOVERED BY TESTS): _save_jobs() has a race condition. "
-    "It writes to a shared '.tmp' file (JOBS_STATE_FILE.with_suffix('.tmp')) "
-    "then calls tmp.replace(STATE_FILE). Two threads racing cause: "
-    "Thread A writes .tmp → Thread B writes .tmp (same path) → Thread A "
-    "renames .tmp to jobs.json → Thread B FileNotFoundError on rename. "
-    "Fix: use a per-call unique tmp filename (e.g., include pid + thread id + uuid) "
-    "or wrap _save_jobs() with a threading.Lock. See main.py:158-163.",
-    strict=False,
-)
 class TestConcurrentStateSafety:
+    """R11: _save_jobs() is now thread-safe via a module-level lock plus
+    per-call unique tmp filenames. (Previously: FileNotFoundError under
+    concurrent writes due to shared .tmp file.)"""
     def test_concurrent_creates_unique_ids(self, client, temp_workspace):
         inp = _create_input_file(temp_workspace)
         results = []

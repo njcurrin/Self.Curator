@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
@@ -155,12 +156,22 @@ def _load_jobs():
                 print(f"Failed to load job {job_id}: {e}")
 
 
+_jobs_lock = threading.Lock()
+
+
 def _save_jobs():
-    """Persist job state to JSON file (atomic write)."""
-    tmp = JOBS_STATE_FILE.with_suffix(".tmp")
-    data = {jid: j.model_dump(mode="json") for jid, j in _jobs.items()}
-    tmp.write_text(json.dumps(data, indent=2, default=str))
-    tmp.replace(JOBS_STATE_FILE)
+    """Persist job state to JSON file (atomic write, thread-safe).
+
+    Uses a per-call unique tmp filename (pid + thread id + uuid) plus
+    a module-level lock so concurrent callers do not collide on the
+    shared .tmp path or produce inconsistent state snapshots.
+    """
+    with _jobs_lock:
+        data = {jid: j.model_dump(mode="json") for jid, j in _jobs.items()}
+        unique = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
+        tmp = JOBS_STATE_FILE.with_suffix(f".{unique}.tmp")
+        tmp.write_text(json.dumps(data, indent=2, default=str))
+        tmp.replace(JOBS_STATE_FILE)
 
 
 # ─── Job Execution ──────────────────────────────────────────────────────
@@ -419,6 +430,7 @@ def create_job(req: CurationJobCreate) -> CurationJob:
         "output_path": req.output_path,
         "text_field": req.text_field,
         "stages": [s.model_dump() for s in req.stages],
+        "output_format": req.output_format,
     }
     config_path = CONFIGS_DIR / f"{job_id}.json"
     config_path.write_text(json.dumps(config, indent=2))

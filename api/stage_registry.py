@@ -249,22 +249,19 @@ def _save_custom_index(index: dict[str, dict]) -> None:
     tmp.replace(CUSTOM_STAGES_INDEX)
 
 
-def _load_custom_stage_class(stage_uuid: str) -> type | None:
-    """Dynamically import a custom stage's .py file and return the class.
+def _load_stage_from_file(filepath: Path, stage_uuid: str) -> type | None:
+    """Dynamically import a stage .py file and return the newly-registered class.
+
+    Inner helper shared by save_custom_stage (validation) and
+    _load_custom_stage_class (lookup). Does NOT consult the index — caller
+    must supply the filepath directly.
 
     The file must define exactly one concrete ProcessingStage subclass.
     Importing it triggers StageMeta registration automatically.
     """
-    index = _load_custom_index()
-    entry = index.get(stage_uuid)
-    if not entry:
-        return None
-
-    filepath = CUSTOM_STAGES_DIR / entry["filename"]
     if not filepath.exists():
         return None
 
-    # Snapshot registry before import to detect what's new
     from nemo_curator.stages.base import _STAGE_REGISTRY
     before = set(_STAGE_REGISTRY.keys())
 
@@ -280,14 +277,22 @@ def _load_custom_stage_class(stage_uuid: str) -> type | None:
         logger.error(f"Failed to load custom stage {stage_uuid}: {e}")
         return None
 
-    # Find newly registered class(es)
     new_classes = set(_STAGE_REGISTRY.keys()) - before
     if not new_classes:
         logger.error(f"Custom stage {stage_uuid} did not register any ProcessingStage")
         return None
 
-    # Return the first new class (user files should define exactly one)
     return _STAGE_REGISTRY[next(iter(new_classes))]
+
+
+def _load_custom_stage_class(stage_uuid: str) -> type | None:
+    """Look up a custom stage by uuid via the index, then load its .py file."""
+    index = _load_custom_index()
+    entry = index.get(stage_uuid)
+    if not entry:
+        return None
+    filepath = CUSTOM_STAGES_DIR / entry["filename"]
+    return _load_stage_from_file(filepath, stage_uuid)
 
 
 def validate_custom_stage_name(name: str) -> str | None:
@@ -345,8 +350,8 @@ def save_custom_stage(name: str, category: str, code: str) -> dict[str, Any]:
     _ensure_custom_dirs()
     filepath.write_text(code)
 
-    # Try to load it to validate it's a valid ProcessingStage
-    cls = _load_custom_stage_class(stage_uuid)
+    # Validate by loading the file directly (index entry doesn't exist yet)
+    cls = _load_stage_from_file(filepath, stage_uuid)
     if cls is None:
         filepath.unlink(missing_ok=True)
         raise ValueError(

@@ -302,9 +302,9 @@ class TestTextFieldBug:
     pytestmark = pytest.mark.fast
 
     def test_build_pipeline_does_not_mutate_config(self, tmp_path):
-        """BUG: build_pipeline() uses stage_params.pop('text_field') which
-        mutates the params dict. After calling build_pipeline, the original
-        config should be unchanged."""
+        """R4 fix: build_pipeline() copies stage params before processing,
+        so caller's original config is preserved. Previously: pop() on the
+        shared params dict silently removed text_field after first modifier."""
         from run_pipeline import build_pipeline
         input_path = str(_write_small_jsonl(tmp_path / "input" / "data.jsonl"))
         config = {
@@ -318,14 +318,8 @@ class TestTextFieldBug:
         }
         original = copy.deepcopy(config)
         build_pipeline(config)
-        # BUG: text_field may be popped from stage params
-        # This test documents whether the mutation occurs
-        for i, stage in enumerate(config["stages"]):
-            if "text_field" not in stage["params"] and "text_field" in original["stages"][i]["params"]:
-                pytest.xfail(
-                    "Known bug: build_pipeline() mutates stage params via pop(). "
-                    "See run_pipeline.py ~line 224."
-                )
+        # After fix: original config dict is untouched.
+        assert config == original, "build_pipeline() mutated the config dict"
 
     def test_multiple_modifiers_no_error(self, tmp_path):
         from run_pipeline import build_pipeline
