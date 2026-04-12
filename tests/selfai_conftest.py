@@ -67,6 +67,17 @@ def temp_workspace(tmp_path, monkeypatch):
             main_module, "CUSTOM_STAGES_DIR", workspace / "custom_stages"
         )
 
+    # Patch stage_registry's module-level CUSTOM_STAGES_DIR and index path.
+    # stage_registry.py has its own import of the path — must be patched separately.
+    try:
+        import stage_registry as sr_module
+        monkeypatch.setattr(sr_module, "CUSTOM_STAGES_DIR", workspace / "custom_stages")
+        monkeypatch.setattr(
+            sr_module, "CUSTOM_STAGES_INDEX", workspace / "custom_stages" / "index.json"
+        )
+    except ImportError:
+        pass
+
     # Reset in-memory state
     main_module._jobs.clear()
     main_module._processes.clear()
