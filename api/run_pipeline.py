@@ -300,19 +300,27 @@ def run_exact_dedup(input_path: str, output_path: str, cache_path: str,
                     text_field: str = "text", assign_id: bool = True) -> None:
     """Two-phase exact dedup: ID identification + document removal."""
     import os
+    import shutil
     from nemo_curator.stages.deduplication.exact.workflow import ExactDeduplicationWorkflow
     from nemo_curator.stages.text.deduplication.removal_workflow import TextDuplicatesRemovalWorkflow
     from nemo_curator.backends.experimental.ray_actor_pool import RayActorPoolExecutor
 
     input_filetype = _detect_filetype(input_path)
-    ids_path = os.path.join(cache_path, "exact_ids_to_remove")
-    os.makedirs(ids_path, exist_ok=True)
+    # Identification writes parquets into {output_path}/ExactDuplicateIds/
+    # and `exact_id_generator.json` into {output_path}/ directly.
+    # TextDuplicatesRemovalStage reads `ids_to_remove_path` with
+    # pandas.read_parquet — which scans every file in that dir — so we
+    # must point it at the parquet-only subdirectory, NOT the sibling
+    # that contains the JSON.
+    id_output_path = os.path.join(cache_path, "exact_identification")
+    os.makedirs(id_output_path, exist_ok=True)
+    ids_path = os.path.join(id_output_path, "ExactDuplicateIds")
 
     executor = RayActorPoolExecutor()
 
-    # Phase A: identify duplicates → write IDs to ids_path
+    # Phase A: identify duplicates → write IDs to id_output_path
     id_workflow = ExactDeduplicationWorkflow(
-        output_path=ids_path,
+        output_path=id_output_path,
         input_path=input_path,
         input_filetype=input_filetype,
         text_field=text_field,
@@ -322,11 +330,20 @@ def run_exact_dedup(input_path: str, output_path: str, cache_path: str,
     id_result = id_workflow.run(executor=executor)
     id_generator_path = id_result.metadata.get("id_generator_path") if assign_id else None
 
-    # Phase B: remove duplicates → write clean data to output_path
-    # When assign_id=True, the ID-generation phase produces a
-    # _curator_dedup_id column on the data and a separate "id" column in
-    # the removal-ids parquet. Both must be passed through explicitly.
+    # Phase B: remove duplicates → write clean data to output_path.
+    #
+    # When assign_id=True, the identification phase writes a parquet of
+    # removal IDs whose ONLY column is named by its own id_field. That
+    # defaults to CURATOR_DEDUP_ID_STR ("_curator_dedup_id") — see
+    # nemo_curator/stages/deduplication/exact/identification.py:94,120.
+    #
+    # TextDuplicatesRemovalWorkflow reads that parquet using
+    # `duplicate_id_field` and must match the column name in the file,
+    # which is _curator_dedup_id (NOT "id"). The workflow default of
+    # "id" is tailored to upstream test fixtures that hand-craft ids
+    # files with an "id" column — that path does not apply here.
     from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
+    id_col = CURATOR_DEDUP_ID_STR if assign_id else "id"
     removal_workflow = TextDuplicatesRemovalWorkflow(
         input_path=input_path,
         ids_to_remove_path=ids_path,
@@ -334,8 +351,8 @@ def run_exact_dedup(input_path: str, output_path: str, cache_path: str,
         input_filetype=input_filetype,
         output_filetype=input_filetype,
         id_generator_path=id_generator_path,
-        id_field=CURATOR_DEDUP_ID_STR if assign_id else "id",
-        duplicate_id_field="id",
+        id_field=id_col,
+        duplicate_id_field=id_col,
     )
     removal_workflow.run(executor=executor)
     logger.info(f"ExactDedup complete → {output_path}")
@@ -348,22 +365,27 @@ def run_fuzzy_dedup(input_path: str, output_path: str, cache_path: str,
                     seed: int = 42) -> None:
     """Multi-phase fuzzy (MinHash/LSH) dedup: minhash → LSH → connected components → removal."""
     import os
+    import shutil
     from nemo_curator.stages.deduplication.fuzzy.workflow import FuzzyDeduplicationWorkflow
     from nemo_curator.stages.text.deduplication.removal_workflow import TextDuplicatesRemovalWorkflow
     from nemo_curator.backends.experimental.ray_actor_pool import RayActorPoolExecutor
 
     input_filetype = _detect_filetype(input_path)
     fuzzy_cache = os.path.join(cache_path, "fuzzy_cache")
-    ids_path = os.path.join(cache_path, "fuzzy_ids_to_remove")
+    # Fuzzy identification writes parquets into
+    # {output_path}/FuzzyDuplicateIds/ and a sibling
+    # fuzzy_id_generator.json. Point removal at the parquet-only subdir.
+    id_output_path = os.path.join(cache_path, "fuzzy_identification")
     os.makedirs(fuzzy_cache, exist_ok=True)
-    os.makedirs(ids_path, exist_ok=True)
+    os.makedirs(id_output_path, exist_ok=True)
+    ids_path = os.path.join(id_output_path, "FuzzyDuplicateIds")
 
     executor = RayActorPoolExecutor()
 
     # Phase A: MinHash → LSH → connected components → identify duplicate IDs
     fuzzy_workflow = FuzzyDeduplicationWorkflow(
         cache_path=fuzzy_cache,
-        output_path=ids_path,
+        output_path=id_output_path,
         input_path=input_path,
         input_filetype=input_filetype,
         text_field=text_field,
@@ -377,8 +399,10 @@ def run_fuzzy_dedup(input_path: str, output_path: str, cache_path: str,
     fuzzy_result = fuzzy_workflow.run(executor=executor)
     id_generator_path = fuzzy_result.metadata.get("id_generator_path")
 
-    # Phase B: remove near-duplicates
+    # Phase B: remove near-duplicates — same column-name logic as exact
+    # dedup. See run_exact_dedup() for the reasoning.
     from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
+    id_col = CURATOR_DEDUP_ID_STR if assign_id else "id"
     removal_workflow = TextDuplicatesRemovalWorkflow(
         input_path=input_path,
         ids_to_remove_path=ids_path,
@@ -386,8 +410,8 @@ def run_fuzzy_dedup(input_path: str, output_path: str, cache_path: str,
         input_filetype=input_filetype,
         output_filetype=input_filetype,
         id_generator_path=id_generator_path,
-        id_field=CURATOR_DEDUP_ID_STR if assign_id else "id",
-        duplicate_id_field="id",
+        id_field=id_col,
+        duplicate_id_field=id_col,
     )
     removal_workflow.run(executor=executor)
     logger.info(f"FuzzyDedup complete → {output_path}")

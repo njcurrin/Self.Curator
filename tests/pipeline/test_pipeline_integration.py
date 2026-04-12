@@ -347,14 +347,6 @@ class TestTextFieldBug:
 # T-128: R5 ExactDedup (integration)
 # ===========================================================================
 
-@pytest.mark.skip(
-    reason="ExactDedup workflow integration needs deeper NeMo Curator investigation. "
-    "TextDuplicatesRemovalWorkflow's phase-B fails with 'No match for FieldRef.Name(id)' "
-    "against the phase-A output schema (only has _curator_dedup_id). Self.curator's "
-    "run_exact_dedup wrapper may need revised id_field / duplicate_id_field semantics, "
-    "or input_fields propagation fixes. Deferred — contract tests around dispatch and "
-    "config round-trip are sufficient for the current test cycle."
-)
 class TestExactDedup:
     pytestmark = pytest.mark.integration
 
@@ -411,11 +403,18 @@ class TestExactDedup:
 # T-129: R6 FuzzyDedup (integration + gpu)
 # ===========================================================================
 
-@pytest.mark.skip(
-    reason="FuzzyDedup shares the same phase-B issue as ExactDedup — see "
-    "TestExactDedup skip reason. Deferred pending workflow debug pass."
-)
 class TestFuzzyDedup:
+    """FuzzyDedup uses RAFT/NCCL for the connected-components phase,
+    which requires multi-GPU coordination primitives. Single-GPU hosts
+    (like this 24GB dev box) fail at NCCL init with 'unhandled cuda
+    error'. The test auto-skips in environments that can't run it.
+
+    The self.curator wrapper itself (run_fuzzy_dedup in run_pipeline.py)
+    follows the same corrected pattern as ExactDedup — directory
+    separation for id_generator.json + CURATOR_DEDUP_ID_STR field
+    naming — so the dispatch layer is verified. True end-to-end
+    fuzzy validation requires a multi-GPU host."""
+
     pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
     def test_removes_near_duplicates(self, tmp_path):
@@ -423,6 +422,20 @@ class TestFuzzyDedup:
             import cudf  # noqa: F401
         except ImportError:
             pytest.skip("cudf not available — FuzzyDedup requires RAPIDS")
+
+        # FuzzyDedup requires multi-GPU NCCL; skip on single-GPU hosts.
+        # Detect via pynvml (available in the curator container).
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            gpu_count = pynvml.nvmlDeviceGetCount()
+            if gpu_count < 2:
+                pytest.skip(
+                    f"FuzzyDedup connected-components phase requires multi-GPU NCCL; "
+                    f"only {gpu_count} GPU detected."
+                )
+        except Exception:
+            pytest.skip("Could not determine GPU count (pynvml unavailable)")
 
         input_dir = tmp_path / "input"
         output_dir = tmp_path / "output"
@@ -457,10 +470,6 @@ class TestFuzzyDedup:
 # T-130: R7 Mixed Pipeline (integration)
 # ===========================================================================
 
-@pytest.mark.skip(
-    reason="Mixed pipeline includes ExactDedup — blocked on same TextDuplicatesRemovalWorkflow "
-    "integration issue. See TestExactDedup skip reason."
-)
 class TestMixedPipeline:
     pytestmark = pytest.mark.integration
 
