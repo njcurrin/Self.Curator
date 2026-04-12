@@ -198,8 +198,7 @@ def build_pipeline(config: dict):
         from nemo_curator.stages.file_partitioning import FilePartitioningStage
 
         pipeline.add_stage(FilePartitioningStage(
-            input_path=input_path,
-            filetype="parquet",
+            file_paths=input_path,
         ))
         pipeline.add_stage(ParquetReaderStage(
             fields=[text_field] if text_field else None,
@@ -262,11 +261,27 @@ def build_pipeline(config: dict):
     return pipeline
 
 
-def _detect_filetype(directory: str) -> str:
-    """Infer file format from what's actually in the output directory."""
+def _detect_filetype(path: str) -> str:
+    """Infer file format from a file path or directory contents.
+
+    Accepts either:
+      - a file path (uses the extension)
+      - a directory path (scans for .jsonl/.parquet files)
+
+    Defaults to "parquet" if nothing is detected.
+    """
     import glob
-    if glob.glob(os.path.join(directory, "*.jsonl")):
-        return "jsonl"
+    p = Path(path)
+    if p.is_file():
+        if str(p).endswith(".jsonl"):
+            return "jsonl"
+        if str(p).endswith(".parquet"):
+            return "parquet"
+    if p.is_dir():
+        if glob.glob(os.path.join(str(p), "*.jsonl")):
+            return "jsonl"
+        if glob.glob(os.path.join(str(p), "*.parquet")):
+            return "parquet"
     return "parquet"
 
 
@@ -297,6 +312,10 @@ def run_exact_dedup(input_path: str, output_path: str, cache_path: str,
     id_generator_path = id_result.metadata.get("id_generator_path") if assign_id else None
 
     # Phase B: remove duplicates → write clean data to output_path
+    # When assign_id=True, the ID-generation phase produces a
+    # _curator_dedup_id column on the data and a separate "id" column in
+    # the removal-ids parquet. Both must be passed through explicitly.
+    from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
     removal_workflow = TextDuplicatesRemovalWorkflow(
         input_path=input_path,
         ids_to_remove_path=ids_path,
@@ -304,6 +323,8 @@ def run_exact_dedup(input_path: str, output_path: str, cache_path: str,
         input_filetype=input_filetype,
         output_filetype=input_filetype,
         id_generator_path=id_generator_path,
+        id_field=CURATOR_DEDUP_ID_STR if assign_id else "id",
+        duplicate_id_field="id",
     )
     removal_workflow.run(executor=executor)
     logger.info(f"ExactDedup complete → {output_path}")
@@ -346,6 +367,7 @@ def run_fuzzy_dedup(input_path: str, output_path: str, cache_path: str,
     id_generator_path = fuzzy_result.metadata.get("id_generator_path")
 
     # Phase B: remove near-duplicates
+    from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
     removal_workflow = TextDuplicatesRemovalWorkflow(
         input_path=input_path,
         ids_to_remove_path=ids_path,
@@ -353,6 +375,8 @@ def run_fuzzy_dedup(input_path: str, output_path: str, cache_path: str,
         input_filetype=input_filetype,
         output_filetype=input_filetype,
         id_generator_path=id_generator_path,
+        id_field=CURATOR_DEDUP_ID_STR if assign_id else "id",
+        duplicate_id_field="id",
     )
     removal_workflow.run(executor=executor)
     logger.info(f"FuzzyDedup complete → {output_path}")
